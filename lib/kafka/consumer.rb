@@ -1,6 +1,7 @@
 require "kafka/consumer_group"
 require "kafka/offset_manager"
 require "kafka/fetch_operation"
+require "kafka/pause"
 
 module Kafka
 
@@ -49,8 +50,11 @@ module Kafka
       @session_timeout = session_timeout
       @heartbeat = heartbeat
 
-      # A list of partitions that have been paused, per topic.
-      @paused_partitions = {}
+      @pauses = Hash.new {|h, k|
+        h[k] = Hash.new {|h2, k2|
+          h2[k2] = Pause.new
+        }
+      }
 
       # Whether or not the consumer is currently consuming messages.
       @running = false
@@ -115,16 +119,28 @@ module Kafka
     # the rest of the partitions to continue being processed.
     #
     # If the `timeout` argument is passed, the partition will automatically be
-    # resumed when the timeout expires.
+    # resumed when the timeout expires. If `exponential_backoff` is enabled, each
+    # subsequent pause will cause the timeout to double until a message from the
+    # partition has been successfully processed.
     #
     # @param topic [String]
     # @param partition [Integer]
-    # @param timeout [Integer] the number of seconds to pause the partition for,
+    # @param timeout [nil, Integer] the number of seconds to pause the partition for,
     #   or `nil` if the partition should not be automatically resumed.
+    # @param max_timeout [nil, Integer] the maximum number of seconds to pause for,
+    #   or `nil` if no maximum should be enforced.
+    # @param exponential_backoff [Boolean] whether to enable exponential backoff.
     # @return [nil]
-    def pause(topic, partition, timeout: nil)
-      @paused_partitions[topic] ||= {}
-      @paused_partitions[topic][partition] = timeout && Time.now + timeout
+    def pause(topic, partition, timeout: nil, max_timeout: nil, exponential_backoff: false)
+      if max_timeout && !exponential_backoff
+        raise ArgumentError, "`max_timeout` only makes sense when `exponential_backoff` is enabled"
+      end
+
+      pause_for(topic, partition).pause!(
+        timeout: timeout,
+        max_timeout: max_timeout,
+        exponential_backoff: exponential_backoff,
+      )
     end
 
     # Resume processing of a topic partition.
@@ -134,8 +150,7 @@ module Kafka
     # @param partition [Integer]
     # @return [nil]
     def resume(topic, partition)
-      paused_partitions = @paused_partitions.fetch(topic, {})
-      paused_partitions.delete(partition)
+      pause_for(topic, partition).resume!
     end
 
     # Whether the topic partition is currently paused.
@@ -145,24 +160,8 @@ module Kafka
     # @param partition [Integer]
     # @return [Boolean] true if the partition is paused, false otherwise.
     def paused?(topic, partition)
-      partitions = @paused_partitions.fetch(topic, {})
-
-      if partitions.key?(partition)
-        # Users can set an optional timeout, after which the partition is
-        # automatically resumed. When pausing, the timeout is translated to an
-        # absolute point in time.
-        timeout = partitions.fetch(partition)
-
-        if timeout.nil?
-          true
-        elsif Time.now < timeout
-          true
-        else
-          @logger.info "Automatically resuming partition #{topic}/#{partition}, pause timeout expired"
-          resume(topic, partition)
-          false
-        end
-      end
+      pause = pause_for(topic, partition)
+      pause.paused? && !pause.expired?
     end
 
     # Fetches and enumerates the messages in the topics that the consumer group
@@ -229,6 +228,10 @@ module Kafka
 
             return if !@running
           end
+
+          # We've successfully processed a batch from the partition, so we can clear
+          # the pause.
+          pause_for(batch.topic, batch.partition).reset!
         end
 
         # We may not have received any messages, but it's still a good idea to
@@ -295,6 +298,10 @@ module Kafka
             end
 
             mark_message_as_processed(batch.messages.last) if automatically_mark_as_processed
+
+            # We've successfully processed a batch from the partition, so we can clear
+            # the pause.
+            pause_for(batch.topic, batch.partition).reset!
           end
 
           @offset_manager.commit_offsets_if_necessary
@@ -400,12 +407,26 @@ module Kafka
       end
     end
 
+    def resume_paused_partitions!
+      @pauses.each do |topic, partitions|
+        partitions.each do |partition, pause|
+
+          if pause.paused? && pause.expired?
+            @logger.info "Automatically resuming partition #{topic}/#{partition}, pause timeout expired"
+            resume(topic, partition)
+          end
+        end
+      end
+    end
+
     def fetch_batches(min_bytes:, max_wait_time:, automatically_mark_as_processed:)
       join_group unless @group.member?
 
       subscribed_partitions = @group.subscribed_partitions
 
       @heartbeat.send_if_necessary
+
+      resume_paused_partitions!
 
       operation = FetchOperation.new(
         cluster: @cluster,
@@ -458,5 +479,10 @@ module Kafka
 
       raise FetchError, e
     end
+
+    def pause_for(topic, partition)
+      @pauses[topic][partition]
+    end
+
   end
 end
